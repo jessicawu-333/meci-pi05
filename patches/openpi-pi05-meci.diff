@@ -1,0 +1,1321 @@
+Binary files a/.ruff_cache/0.17.6/10301288788814264241 and b/.ruff_cache/0.17.6/10301288788814264241 differ
+Binary files a/.ruff_cache/0.17.6/10792518353941284671 and b/.ruff_cache/0.17.6/10792518353941284671 differ
+Binary files a/.ruff_cache/0.17.6/11116856814120620100 and b/.ruff_cache/0.17.6/11116856814120620100 differ
+Binary files a/.ruff_cache/0.17.6/14537930458951297464 and b/.ruff_cache/0.17.6/14537930458951297464 differ
+Binary files a/.ruff_cache/0.17.6/18076515271387724270 and b/.ruff_cache/0.17.6/18076515271387724270 differ
+Binary files a/.ruff_cache/0.17.6/5744482000639621942 and b/.ruff_cache/0.17.6/5744482000639621942 differ
+Binary files a/.ruff_cache/0.17.6/9601166020227033188 and b/.ruff_cache/0.17.6/9601166020227033188 differ
+Binary files a/.ruff_cache/0.17.6/9616941180636493712 and b/.ruff_cache/0.17.6/9616941180636493712 differ
+diff -ruN a/src/openpi/models/meci_correction.py b/src/openpi/models/meci_correction.py
+--- a/src/openpi/models/meci_correction.py
++++ b/src/openpi/models/meci_correction.py
+@@ -0,0 +1,225 @@
++"""MECI for pi0.5 (openpi, JAX / Flax NNX): spoken metric corrections injected into the action expert.
++
++Hook points (Physical-Intelligence/openpi @ 215abfb217dbac7d5f1273282331b9b1866c0479,
++src/openpi/models/pi0.py):
++  * Pi0.embed_suffix (l.140-186), pi05 branch (l.162-169): the action-expert input tokens
++    `action_expert_tokens` and the adaRMS conditioning vector `adarms_cond` (flow-matching time MLP)
++    are produced here. MECI adds (a) gated cross-attention from the action tokens to the correction
++    tokens, (b) a gated additive term on `adarms_cond`, and optionally (c) extra suffix tokens.
++  * The action read-out `self.action_out_proj(suffix_out[:, -self.action_horizon:])`
++    (compute_loss l.212, sample_actions step l.269): MECI applies a gated cross-attention
++    "pre-head" block to the action-position hidden states just before `action_out_proj`
++    (the analogue of the OpenVLA-OFT fusion point).
++  * adaRMS itself (src/openpi/models/gemma.py RMSNorm l.112-131): `modulation = Dense(3*d,
++    kernel_init=zeros)(cond)` -> scale, shift, gate applied to every action-expert layer, so a change
++    of `adarms_cond` reaches all 18 expert layers (gemma_300m depth=18, gemma.py l.69-78).
++
++Identity guarantees:
++  * every fusion path is multiplied by tanh(g) with g a zero-initialised scalar, and by the per-sample
++    correction strength s in [0, 1] (0 when no correction is active). With g = 0 or s = 0 the action
++    tokens, adarms_cond and pre-head hidden states are *exactly* the pretrained ones.
++  * "suffix_tokens" mode adds K extra suffix tokens whose input_mask is False when no correction is
++    active; openpi's make_attn_mask (pi0.py l.19-44) then excludes them, and positions are computed
++    with cumsum(input_mask) so the action-token positions are unchanged -> identical outputs when no
++    correction is active (but NOT identical at initialisation while a correction is active).
++"""
++
++from __future__ import annotations
++
++import dataclasses
++
++import flax.nnx as nnx
++import jax
++import jax.numpy as jnp
++
++# Scale used to feed metric delta-p (m, rad) to the networks at O(1): 5 cm and 0.5 rad.
++DELTA_SCALE = (0.05, 0.05, 0.05, 0.5, 0.5, 0.5)
++NUM_EFFECTORS = 3  # default / left / right (meci_metric.EFFECTORS)
++MODES = ("gated", "suffix_tokens", "gated+suffix_tokens")
++
++
++@dataclasses.dataclass(frozen=True)
++class MECIConfig:
++    audio_dim: int = 768  # Whisper-small encoder width (d_model=768)
++    num_queries: int = 16  # learned-query projector -> K correction tokens
++    num_heads: int = 8
++    mode: str = "gated"
++    use_given_delta: bool = True  # condition on the parsed/teacher delta-p when provided
++    aux_weight: float = 0.1  # weight of the auxiliary delta-p / effector loss in compute_loss
++    explicit_residual: bool = True  # add obs.correction_residual to sampled actions / subtract from targets
++
++    def __post_init__(self):
++        if self.mode not in MODES:
++            raise ValueError(f"mode must be one of {MODES}")
++
++
++@dataclasses.dataclass
++class CorrectionContext:
++    tokens: jax.Array  # (b, K, w) correction tokens
++    token_mask: jax.Array  # (b, K) bool, True where a correction is active
++    pooled: jax.Array  # (b, w)
++    strength: jax.Array  # (b,) in [0, 1]; 0 when inactive
++    delta_hat: jax.Array  # (b, 6) predicted delta-p in metres / radians
++    effector_logits: jax.Array  # (b, 3)
++
++
++class _CrossAttention(nnx.Module):
++    """Multi-head cross-attention x -> ctx with optional zero-initialised output projection."""
++
++    def __init__(self, q_dim: int, kv_dim: int, width: int, num_heads: int, *, zero_out: bool, rngs: nnx.Rngs):
++        assert width % num_heads == 0
++        self.num_heads = num_heads
++        self.q = nnx.Linear(q_dim, width, rngs=rngs)
++        self.k = nnx.Linear(kv_dim, width, rngs=rngs)
++        self.v = nnx.Linear(kv_dim, width, rngs=rngs)
++        init = nnx.initializers.zeros_init() if zero_out else nnx.initializers.lecun_normal()
++        self.o = nnx.Linear(width, q_dim, kernel_init=init, rngs=rngs)
++
++    def __call__(self, x: jax.Array, ctx: jax.Array, ctx_mask: jax.Array | None = None) -> jax.Array:
++        b, n, _ = x.shape
++        m = ctx.shape[1]
++        h = self.num_heads
++        q = self.q(x).reshape(b, n, h, -1)
++        k = self.k(ctx).reshape(b, m, h, -1)
++        v = self.v(ctx).reshape(b, m, h, -1)
++        logits = jnp.einsum("bnhd,bmhd->bhnm", q, k) / jnp.sqrt(q.shape[-1]).astype(q.dtype)
++        if ctx_mask is not None:
++            logits = jnp.where(ctx_mask[:, None, None, :], logits, -1e30)
++        probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(v.dtype)
++        out = jnp.einsum("bhnm,bmhd->bnhd", probs, v).reshape(b, n, -1)
++        return self.o(out)
++
++
++class MECICorrection(nnx.Module):
++    """Audio -> correction tokens -> conditioning of the pi0.5 action expert."""
++
++    def __init__(self, width: int, config: MECIConfig, rngs: nnx.Rngs):
++        self.config = config
++        self.width = width
++        self.audio_norm = nnx.LayerNorm(config.audio_dim, rngs=rngs)
++        self.queries = nnx.Param(jax.random.normal(rngs.params(), (config.num_queries, width)) * 0.02)
++        # learned-query (Perceiver-style) projector over frozen Whisper features
++        self.projector = _CrossAttention(width, config.audio_dim, width, config.num_heads, zero_out=False, rngs=rngs)
++        self.proj_norm = nnx.LayerNorm(width, rngs=rngs)
++        self.proj_mlp_in = nnx.Linear(width, 2 * width, rngs=rngs)
++        self.proj_mlp_out = nnx.Linear(2 * width, width, rngs=rngs)
++        # displacement head: pooled tokens -> delta-p (6, scaled) + effector logits (3); zero-init output
++        self.disp_in = nnx.Linear(width, width, rngs=rngs)
++        self.disp_out = nnx.Linear(width, 6 + NUM_EFFECTORS, kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
++        # zero-init conditioners: delta-p and effector embeddings added to every correction token
++        self.delta_embed = nnx.Linear(6, width, kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
++        self.effector_embed = nnx.Embed(NUM_EFFECTORS, width, embedding_init=nnx.initializers.zeros_init(), rngs=rngs)
++        # fusion paths, each with a zero-initialised scalar gate
++        self.in_xattn = _CrossAttention(width, width, width, config.num_heads, zero_out=False, rngs=rngs)
++        self.gate_in = nnx.Param(jnp.zeros(()))
++        self.ada_proj = nnx.Linear(width, width, rngs=rngs)
++        self.gate_ada = nnx.Param(jnp.zeros(()))
++        self.head_xattn = _CrossAttention(width, width, width, config.num_heads, zero_out=False, rngs=rngs)
++        self.gate_head = nnx.Param(jnp.zeros(()))
++
++    # ------------------------------------------------------------------ encode
++    def encode(self, obs) -> CorrectionContext:
++        """Build correction tokens from `obs.correction_*` (see patched openpi Observation)."""
++        audio = obs.correction_audio.astype(jnp.float32)
++        b = audio.shape[0]
++        audio_mask = (
++            obs.correction_audio_mask
++            if obs.correction_audio_mask is not None
++            else jnp.ones(audio.shape[:2], dtype=jnp.bool_)
++        )
++        active = (
++            obs.correction_active.astype(jnp.bool_)
++            if obs.correction_active is not None
++            else jnp.any(audio_mask, axis=-1)
++        )
++        strength = obs.correction_strength if obs.correction_strength is not None else jnp.ones((b,))
++        strength = jnp.where(active, strength.astype(jnp.float32), 0.0)
++
++        q = jnp.broadcast_to(self.queries.value[None], (b, *self.queries.value.shape))
++        tok = q + self.projector(q, self.audio_norm(audio), audio_mask)
++        tok = tok + self.proj_mlp_out(nnx.gelu(self.proj_mlp_in(self.proj_norm(tok))))
++
++        pooled = jnp.mean(tok, axis=1)
++        head = self.disp_out(nnx.swish(self.disp_in(pooled)))
++        scale = jnp.asarray(DELTA_SCALE, dtype=jnp.float32)
++        delta_hat = head[:, :6] * scale
++        eff_logits = head[:, 6:]
++
++        if self.config.use_given_delta and obs.correction_delta is not None:
++            delta_cond = obs.correction_delta.astype(jnp.float32) / scale
++        else:
++            delta_cond = jax.lax.stop_gradient(delta_hat) / scale
++        if self.config.use_given_delta and obs.correction_effector is not None:
++            eff_emb = self.effector_embed(obs.correction_effector.astype(jnp.int32))
++        else:
++            eff_emb = jax.nn.softmax(eff_logits, axis=-1) @ self.effector_embed.embedding.value
++        tok = tok + self.delta_embed(delta_cond)[:, None, :] + eff_emb[:, None, :]
++        pooled = jnp.mean(tok, axis=1)
++        token_mask = jnp.broadcast_to(active[:, None], tok.shape[:2])
++        return CorrectionContext(tok, token_mask, pooled, strength, delta_hat, eff_logits)
++
++    # ------------------------------------------------------------------ fusion
++    def condition_suffix(self, ctx: CorrectionContext, action_tokens: jax.Array, adarms_cond: jax.Array):
++        """Gated conditioning of the action-expert inputs. Identity when gates are 0 or strength is 0."""
++        s = ctx.strength.astype(action_tokens.dtype)
++        if self.config.mode in ("gated", "gated+suffix_tokens"):
++            g_in = jnp.tanh(self.gate_in.value).astype(action_tokens.dtype)
++            action_tokens = action_tokens + g_in * s[:, None, None] * self.in_xattn(
++                action_tokens, ctx.tokens.astype(action_tokens.dtype), ctx.token_mask
++            )
++            g_ada = jnp.tanh(self.gate_ada.value).astype(adarms_cond.dtype)
++            adarms_cond = adarms_cond + g_ada * s[:, None].astype(adarms_cond.dtype) * self.ada_proj(ctx.pooled).astype(
++                adarms_cond.dtype
++            )
++        return action_tokens, adarms_cond
++
++    def suffix_tokens(self, ctx: CorrectionContext):
++        """Extra suffix tokens (mode includes 'suffix_tokens'): (tokens, input_mask, ar_mask)."""
++        k = ctx.tokens.shape[1]
++        ar = [True] + [False] * (k - 1)  # own block: sees prefix + itself; action tokens see it
++        return ctx.tokens, ctx.token_mask, ar
++
++    def pre_head(self, ctx: CorrectionContext, h: jax.Array) -> jax.Array:
++        """Gated cross-attention on action-position hidden states right before action_out_proj."""
++        if self.config.mode not in ("gated", "gated+suffix_tokens"):
++            return h
++        g = jnp.tanh(self.gate_head.value).astype(h.dtype)
++        s = ctx.strength.astype(h.dtype)[:, None, None]
++        return h + g * s * self.head_xattn(h, ctx.tokens.astype(h.dtype), ctx.token_mask)
++
++    def gated_residual(self, ctx: CorrectionContext, residual: jax.Array) -> jax.Array:
++        """Explicit residual (normalized units), applied only to samples with an active correction."""
++        return jnp.where(ctx.token_mask[:, 0, None, None], residual.astype(jnp.float32), 0.0)
++
++    # ------------------------------------------------------------------ losses
++    def aux_loss(self, ctx: CorrectionContext, obs) -> jax.Array:
++        """Per-sample auxiliary loss: L1 on scaled delta-p + effector cross-entropy, active samples only."""
++        b = ctx.delta_hat.shape[0]
++        active = ctx.token_mask[:, 0].astype(jnp.float32)
++        loss = jnp.zeros((b,), jnp.float32)
++        scale = jnp.asarray(DELTA_SCALE, dtype=jnp.float32)
++        if obs.correction_delta is not None:
++            loss = loss + jnp.mean(jnp.abs((ctx.delta_hat - obs.correction_delta) / scale), axis=-1)
++        if obs.correction_effector is not None:
++            logp = jax.nn.log_softmax(ctx.effector_logits, axis=-1)
++            loss = loss - jnp.take_along_axis(logp, obs.correction_effector[:, None].astype(jnp.int32), axis=-1)[:, 0]
++        return active * loss
++
++
++# ---------------------------------------------------------------------- RL helpers (flow matching)
++def awr_weights(advantages: jax.Array, beta: float = 1.0, w_max: float = 20.0) -> jax.Array:
++    """AWR weights exp(A / beta), clipped; multiply openpi's per-sample flow-matching loss by these."""
++    return jnp.minimum(jnp.exp(advantages / beta), w_max)
++
++
++def flow_dpo_loss(
++    loss_pos: jax.Array, loss_neg: jax.Array, ref_loss_pos: jax.Array, ref_loss_neg: jax.Array, beta: float = 1.0
++) -> jax.Array:
++    """Diffusion-DPO-style preference loss on flow-matching errors (Wallace et al., arXiv:2311.12908).
++
++    Each argument is a per-sample flow-matching loss (mean over chunk) evaluated with the SAME noise and
++    time for the policy and the frozen reference; the flow-matching error stands in for -log-likelihood.
++    pos = during-correction (preferred) chunk, neg = pre-correction chunk from the same state.
++    """
++    margin = (loss_pos - ref_loss_pos) - (loss_neg - ref_loss_neg)
++    return -jax.nn.log_sigmoid(-beta * margin)
+diff -ruN a/src/openpi/models/model.py b/src/openpi/models/model.py
+--- a/src/openpi/models/model.py
++++ b/src/openpi/models/model.py
+@@ -106,6 +106,19 @@
+     # Token loss mask (for FAST autoregressive model).
+     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+ 
++    # MECI spoken-correction fields (all optional; None = no correction input).
++    # Frozen Whisper encoder features of the utterance and their validity mask.
++    correction_audio: at.Float[ArrayT, "*b ta da"] | None = None
++    correction_audio_mask: at.Bool[ArrayT, "*b ta"] | None = None
++    # Whether a correction is active at this step and its hold/fade strength in [0, 1].
++    correction_active: at.Bool[ArrayT, "*b"] | None = None
++    correction_strength: at.Float[ArrayT, "*b"] | None = None
++    # Parsed / teacher metric displacement [dx, dy, dz, droll, dpitch, dyaw] (m, rad) and effector id.
++    correction_delta: at.Float[ArrayT, "*b 6"] | None = None
++    correction_effector: at.Int[ArrayT, "*b"] | None = None
++    # Explicit residual in normalized model action space, (action_horizon, action_dim).
++    correction_residual: at.Float[ArrayT, "*b ah ad"] | None = None
++
+     @classmethod
+     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
+         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
+@@ -126,6 +139,7 @@
+             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+             token_ar_mask=data.get("token_ar_mask"),
+             token_loss_mask=data.get("token_loss_mask"),
++            **{k: data.get(k) for k in CORRECTION_KEYS},
+         )
+ 
+     def to_dict(self) -> at.PyTree[ArrayT]:
+@@ -136,6 +150,18 @@
+         return result
+ 
+ 
++# Optional MECI spoken-correction keys carried through the data transforms into the Observation.
++CORRECTION_KEYS = (
++    "correction_audio",
++    "correction_audio_mask",
++    "correction_active",
++    "correction_strength",
++    "correction_delta",
++    "correction_effector",
++    "correction_residual",
++)
++
++
+ # Defines the format of the actions. This field is included as "actions" inside the dictionary
+ # produced by the data transforms.
+ Actions = at.Float[ArrayT, "*b ah ad"]
+@@ -205,6 +231,7 @@
+         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+         token_ar_mask=observation.token_ar_mask,
+         token_loss_mask=observation.token_loss_mask,
++        **{k: getattr(observation, k) for k in CORRECTION_KEYS},
+     )
+ 
+ 
+diff -ruN a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -7,6 +7,7 @@
+ import jax.numpy as jnp
+ from typing_extensions import override
+ 
++from openpi.models import meci_correction as _meci
+ from openpi.models import model as _model
+ from openpi.models import pi0_config
+ import openpi.models.gemma as _gemma
+@@ -98,6 +99,14 @@
+             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
+             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
++        # MECI: spoken metric-correction adapter for the pi0.5 action expert (None = unchanged model).
++        self.meci_config = config.meci
++        if config.meci is not None:
++            if not config.pi05:
++                raise ValueError("MECI correction adapter is implemented for pi05=True only.")
++            self.meci_correction = _meci.MECICorrection(action_expert_config.width, config.meci, rngs=rngs)
++        else:
++            self.meci_correction = None
+ 
+         # This attribute gets automatically set by model.train() and model.eval().
+         self.deterministic = True
+@@ -138,7 +147,11 @@
+ 
+     @at.typecheck
+     def embed_suffix(
+-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
++        self,
++        obs: _model.Observation,
++        noisy_actions: _model.Actions,
++        timestep: at.Float[at.Array, " b"],
++        meci_ctx: _meci.CorrectionContext | None = None,
+     ) -> tuple[
+         at.Float[at.Array, "b s emb"],
+         at.Bool[at.Array, "b s"],
+@@ -167,6 +180,16 @@
+             time_emb = nnx.swish(time_emb)
+             action_expert_tokens = action_tokens
+             adarms_cond = time_emb
++            if meci_ctx is not None:
++                # MECI: gated, zero-initialised conditioning of the action tokens and of adaRMS.
++                action_expert_tokens, adarms_cond = self.meci_correction.condition_suffix(
++                    meci_ctx, action_expert_tokens, adarms_cond
++                )
++                if "suffix_tokens" in self.meci_config.mode:
++                    corr_tokens, corr_mask, corr_ar = self.meci_correction.suffix_tokens(meci_ctx)
++                    tokens.append(corr_tokens.astype(action_expert_tokens.dtype))
++                    input_mask.append(corr_mask)
++                    ar_mask += corr_ar
+         else:
+             # mix timestep + action information using an MLP (no adaRMS)
+             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+@@ -185,6 +208,17 @@
+         ar_mask = jnp.array(ar_mask)
+         return tokens, input_mask, ar_mask, adarms_cond
+ 
++    def _meci_context(self, observation: _model.Observation) -> _meci.CorrectionContext | None:
++        if self.meci_correction is None or observation.correction_audio is None:
++            return None
++        return self.meci_correction.encode(observation)
++
++    def _action_readout(self, suffix_out, meci_ctx):
++        h = suffix_out[:, -self.action_horizon :]
++        if meci_ctx is not None:
++            h = self.meci_correction.pre_head(meci_ctx, h)
++        return self.action_out_proj(h)
++
+     @override
+     def compute_loss(
+         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+@@ -193,6 +227,10 @@
+         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+ 
+         batch_shape = actions.shape[:-2]
++        meci_ctx = self._meci_context(observation)
++        if meci_ctx is not None and self.meci_config.explicit_residual and observation.correction_residual is not None:
++            # The explicit residual is added after sampling, so the flow is trained on (corrected - residual).
++            actions = actions - self.meci_correction.gated_residual(meci_ctx, observation.correction_residual)
+         noise = jax.random.normal(noise_rng, actions.shape)
+         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+         time_expanded = time[..., None, None]
+@@ -201,7 +239,7 @@
+ 
+         # one big forward pass of prefix + suffix at once
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
++        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time, meci_ctx)
+         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+         attn_mask = make_attn_mask(input_mask, ar_mask)
+@@ -209,9 +247,12 @@
+         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+         )
+-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++        v_t = self._action_readout(suffix_out, meci_ctx)
+ 
+-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
++        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
++        if meci_ctx is not None and self.meci_config.aux_weight > 0:
++            loss = loss + self.meci_config.aux_weight * self.meci_correction.aux_loss(meci_ctx, observation)[:, None]
++        return loss
+ 
+     @override
+     def sample_actions(
+@@ -230,6 +271,8 @@
+         if noise is None:
+             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+ 
++        meci_ctx = self._meci_context(observation)
++
+         # first fill KV cache with a forward pass of the prefix
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+@@ -239,7 +282,7 @@
+         def step(carry):
+             x_t, time = carry
+             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+-                observation, x_t, jnp.broadcast_to(time, batch_size)
++                observation, x_t, jnp.broadcast_to(time, batch_size), meci_ctx
+             )
+             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
+             # other
+@@ -266,7 +309,7 @@
+                 adarms_cond=[None, adarms_cond],
+             )
+             assert prefix_out is None
+-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            v_t = self._action_readout(suffix_out, meci_ctx)
+ 
+             return x_t + dt * v_t, time + dt
+ 
+@@ -276,4 +319,7 @@
+             return time >= -dt / 2
+ 
+         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++        if meci_ctx is not None and self.meci_config.explicit_residual and observation.correction_residual is not None:
++            # MECI explicit residual (normalized units): cumulative EE motion of the named effector == delta-p.
++            x_0 = x_0 + self.meci_correction.gated_residual(meci_ctx, observation.correction_residual)
+         return x_0
+diff -ruN a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
+--- a/src/openpi/models/pi0_config.py
++++ b/src/openpi/models/pi0_config.py
+@@ -6,6 +6,7 @@
+ import jax.numpy as jnp
+ from typing_extensions import override
+ 
++from openpi.models import meci_correction as _meci
+ from openpi.models import model as _model
+ import openpi.models.gemma as _gemma
+ from openpi.shared import array_typing as at
+@@ -34,6 +35,9 @@
+ 
+     pytorch_compile_mode: str | None = "max-autotune"
+ 
++    # MECI: spoken mid-execution metric-correction adapter (pi05 only). None = unchanged openpi model.
++    meci: _meci.MECIConfig | None = None
++
+     def __post_init__(self):
+         if self.max_token_len is None:
+             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+diff -ruN a/src/openpi/models_pytorch/meci_correction_pytorch.py b/src/openpi/models_pytorch/meci_correction_pytorch.py
+--- a/src/openpi/models_pytorch/meci_correction_pytorch.py
++++ b/src/openpi/models_pytorch/meci_correction_pytorch.py
+@@ -0,0 +1,159 @@
++"""MECI for pi0.5 -- PyTorch variant for openpi's PyTorch port (src/openpi/models_pytorch/pi0_pytorch.py).
++
++Mirrors meci_correction.py (JAX / Flax NNX) one-to-one. Hook points in PI0Pytorch
++(openpi @ 215abfb217dbac7d5f1273282331b9b1866c0479):
++  * embed_suffix (l.238-315), pi05 branch (l.288-298): `action_time_emb = action_emb`, `adarms_cond = time_emb`.
++  * forward (l.317-374) and denoise_step (l.422-462): `self.action_out_proj(suffix_out)` read-out.
++  * sample_actions (l.376-420): Euler loop; the explicit residual is added to the final x_t.
++Same identity guarantees: zero-initialised tanh gates x per-sample strength (0 when inactive).
++"""
++
++from __future__ import annotations
++
++import dataclasses
++
++import torch
++from torch import nn
++import torch.nn.functional as F  # noqa: N812
++
++from openpi.models.meci_correction import DELTA_SCALE
++from openpi.models.meci_correction import NUM_EFFECTORS
++from openpi.models.meci_correction import MECIConfig
++
++
++@dataclasses.dataclass
++class CorrectionContextTorch:
++    tokens: torch.Tensor  # (b, K, w)
++    token_mask: torch.Tensor  # (b, K) bool
++    pooled: torch.Tensor  # (b, w)
++    strength: torch.Tensor  # (b,)
++    delta_hat: torch.Tensor  # (b, 6)
++    effector_logits: torch.Tensor  # (b, 3)
++
++
++class _CrossAttention(nn.Module):
++    def __init__(self, q_dim: int, kv_dim: int, width: int, num_heads: int, *, zero_out: bool):
++        super().__init__()
++        assert width % num_heads == 0
++        self.num_heads = num_heads
++        self.q = nn.Linear(q_dim, width)
++        self.k = nn.Linear(kv_dim, width)
++        self.v = nn.Linear(kv_dim, width)
++        self.o = nn.Linear(width, q_dim)
++        if zero_out:
++            nn.init.zeros_(self.o.weight)
++            nn.init.zeros_(self.o.bias)
++
++    def forward(self, x, ctx, ctx_mask=None):
++        b, n, _ = x.shape
++        m = ctx.shape[1]
++        h = self.num_heads
++        q = self.q(x).view(b, n, h, -1).transpose(1, 2)
++        k = self.k(ctx).view(b, m, h, -1).transpose(1, 2)
++        v = self.v(ctx).view(b, m, h, -1).transpose(1, 2)
++        logits = (q @ k.transpose(-1, -2)) / (q.shape[-1] ** 0.5)
++        if ctx_mask is not None:
++            logits = logits.masked_fill(~ctx_mask[:, None, None, :], -1e30)
++        probs = torch.softmax(logits.float(), dim=-1).to(v.dtype)
++        out = (probs @ v).transpose(1, 2).reshape(b, n, -1)
++        return self.o(out)
++
++
++class MECICorrectionTorch(nn.Module):
++    def __init__(self, width: int, config: MECIConfig):
++        super().__init__()
++        self.config = config
++        self.audio_norm = nn.LayerNorm(config.audio_dim)
++        self.queries = nn.Parameter(torch.randn(config.num_queries, width) * 0.02)
++        self.projector = _CrossAttention(width, config.audio_dim, width, config.num_heads, zero_out=False)
++        self.proj_norm = nn.LayerNorm(width)
++        self.proj_mlp = nn.Sequential(nn.Linear(width, 2 * width), nn.GELU(), nn.Linear(2 * width, width))
++        self.disp_in = nn.Linear(width, width)
++        self.disp_out = nn.Linear(width, 6 + NUM_EFFECTORS)
++        nn.init.zeros_(self.disp_out.weight)
++        nn.init.zeros_(self.disp_out.bias)
++        self.delta_embed = nn.Linear(6, width)
++        nn.init.zeros_(self.delta_embed.weight)
++        nn.init.zeros_(self.delta_embed.bias)
++        self.effector_embed = nn.Embedding(NUM_EFFECTORS, width)
++        nn.init.zeros_(self.effector_embed.weight)
++        self.in_xattn = _CrossAttention(width, width, width, config.num_heads, zero_out=False)
++        self.gate_in = nn.Parameter(torch.zeros(()))
++        self.ada_proj = nn.Linear(width, width)
++        self.gate_ada = nn.Parameter(torch.zeros(()))
++        self.head_xattn = _CrossAttention(width, width, width, config.num_heads, zero_out=False)
++        self.gate_head = nn.Parameter(torch.zeros(()))
++        self.register_buffer("delta_scale", torch.tensor(DELTA_SCALE, dtype=torch.float32), persistent=False)
++
++    def encode(self, obs) -> CorrectionContextTorch:
++        audio = obs.correction_audio.float()
++        b = audio.shape[0]
++        audio_mask = getattr(obs, "correction_audio_mask", None)
++        if audio_mask is None:
++            audio_mask = torch.ones(audio.shape[:2], dtype=torch.bool, device=audio.device)
++        active = getattr(obs, "correction_active", None)
++        active = audio_mask.any(-1) if active is None else active.bool()
++        strength = getattr(obs, "correction_strength", None)
++        strength = torch.ones(b, device=audio.device) if strength is None else strength.float()
++        strength = torch.where(active, strength, torch.zeros_like(strength))
++
++        q = self.queries[None].expand(b, -1, -1).to(audio.dtype)
++        tok = q + self.projector(q, self.audio_norm(audio), audio_mask.bool())
++        tok = tok + self.proj_mlp(self.proj_norm(tok))
++        pooled = tok.mean(1)
++        head = self.disp_out(F.silu(self.disp_in(pooled)))
++        delta_hat = head[:, :6] * self.delta_scale
++        eff_logits = head[:, 6:]
++
++        given_delta = getattr(obs, "correction_delta", None)
++        if self.config.use_given_delta and given_delta is not None:
++            delta_cond = given_delta.float() / self.delta_scale
++        else:
++            delta_cond = delta_hat.detach() / self.delta_scale
++        given_eff = getattr(obs, "correction_effector", None)
++        if self.config.use_given_delta and given_eff is not None:
++            eff_emb = self.effector_embed(given_eff.long())
++        else:
++            eff_emb = torch.softmax(eff_logits, -1) @ self.effector_embed.weight
++        tok = tok + self.delta_embed(delta_cond)[:, None] + eff_emb[:, None]
++        pooled = tok.mean(1)
++        token_mask = active[:, None].expand(b, tok.shape[1])
++        return CorrectionContextTorch(tok, token_mask, pooled, strength, delta_hat, eff_logits)
++
++    def condition_suffix(self, ctx, action_tokens, adarms_cond):
++        if self.config.mode in ("gated", "gated+suffix_tokens"):
++            s = ctx.strength.to(action_tokens.dtype)
++            action_tokens = action_tokens + torch.tanh(self.gate_in).to(action_tokens.dtype) * s[
++                :, None, None
++            ] * self.in_xattn(action_tokens, ctx.tokens.to(action_tokens.dtype), ctx.token_mask)
++            adarms_cond = adarms_cond + torch.tanh(self.gate_ada).to(adarms_cond.dtype) * s[:, None].to(
++                adarms_cond.dtype
++            ) * self.ada_proj(ctx.pooled).to(adarms_cond.dtype)
++        return action_tokens, adarms_cond
++
++    def suffix_tokens(self, ctx):
++        k = ctx.tokens.shape[1]
++        return ctx.tokens, ctx.token_mask, [1] + [0] * (k - 1)
++
++    def pre_head(self, ctx, h):
++        if self.config.mode not in ("gated", "gated+suffix_tokens"):
++            return h
++        s = ctx.strength.to(h.dtype)[:, None, None]
++        return h + torch.tanh(self.gate_head).to(h.dtype) * s * self.head_xattn(
++            h, ctx.tokens.to(h.dtype), ctx.token_mask
++        )
++
++    def gated_residual(self, ctx, residual):
++        """Explicit residual (normalized units), applied only to samples with an active correction."""
++        return torch.where(ctx.token_mask[:, 0, None, None], residual.float(), torch.zeros_like(residual.float()))
++
++    def aux_loss(self, ctx, obs):
++        active = ctx.token_mask[:, 0].float()
++        loss = torch.zeros_like(active)
++        given_delta = getattr(obs, "correction_delta", None)
++        if given_delta is not None:
++            loss = loss + ((ctx.delta_hat - given_delta.float()) / self.delta_scale).abs().mean(-1)
++        given_eff = getattr(obs, "correction_effector", None)
++        if given_eff is not None:
++            loss = loss + F.cross_entropy(ctx.effector_logits, given_eff.long(), reduction="none")
++        return active * loss
+diff -ruN a/src/openpi/models_pytorch/pi0_pytorch.py b/src/openpi/models_pytorch/pi0_pytorch.py
+--- a/src/openpi/models_pytorch/pi0_pytorch.py
++++ b/src/openpi/models_pytorch/pi0_pytorch.py
+@@ -8,6 +8,7 @@
+ 
+ import openpi.models.gemma as _gemma
+ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
++from openpi.models_pytorch.meci_correction_pytorch import MECICorrectionTorch
+ import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+ 
+ 
+@@ -108,6 +109,15 @@
+             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+ 
++        # MECI: spoken metric-correction adapter (pi05 only); None = unchanged model.
++        self.meci_config = getattr(config, "meci", None)
++        if self.meci_config is not None:
++            if not self.pi05:
++                raise ValueError("MECI correction adapter is implemented for pi05=True only.")
++            self.meci_correction = MECICorrectionTorch(action_expert_config.width, self.meci_config)
++        else:
++            self.meci_correction = None
++
+         torch.set_float32_matmul_precision("high")
+         if config.pytorch_compile_mode is not None:
+             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+@@ -235,7 +245,18 @@
+ 
+         return embs, pad_masks, att_masks
+ 
+-    def embed_suffix(self, state, noisy_actions, timestep):
++    def _meci_context(self, observation):
++        if self.meci_correction is None or getattr(observation, "correction_audio", None) is None:
++            return None
++        return self.meci_correction.encode(observation)
++
++    def _meci_residual(self, observation, meci_ctx):
++        if meci_ctx is None or not self.meci_config.explicit_residual:
++            return None
++        residual = getattr(observation, "correction_residual", None)
++        return None if residual is None else self.meci_correction.gated_residual(meci_ctx, residual)
++
++    def embed_suffix(self, state, noisy_actions, timestep, meci_ctx=None):
+         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+         embs = []
+         pad_masks = []
+@@ -296,6 +317,16 @@
+             time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+             action_time_emb = action_emb
+             adarms_cond = time_emb
++            if meci_ctx is not None:
++                # MECI: gated, zero-initialised conditioning of the action tokens and of adaRMS.
++                action_time_emb, adarms_cond = self.meci_correction.condition_suffix(
++                    meci_ctx, action_time_emb, adarms_cond
++                )
++                if "suffix_tokens" in self.meci_config.mode:
++                    corr_tokens, corr_mask, corr_att = self.meci_correction.suffix_tokens(meci_ctx)
++                    embs.append(corr_tokens.to(action_time_emb.dtype))
++                    pad_masks.append(corr_mask)
++                    att_masks += corr_att
+ 
+         # Add to input tokens
+         embs.append(action_time_emb)
+@@ -324,12 +355,18 @@
+         if time is None:
+             time = self.sample_time(actions.shape[0], actions.device)
+ 
++        meci_ctx = self._meci_context(observation)
++        meci_residual = self._meci_residual(observation, meci_ctx)
++        if meci_residual is not None:
++            # The explicit residual is added after sampling, so the flow is trained on (corrected - residual).
++            actions = actions - meci_residual.to(actions.dtype)
++
+         time_expanded = time[:, None, None]
+         x_t = time_expanded * noise + (1 - time_expanded) * actions
+         u_t = noise - actions
+ 
+         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
++        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time, meci_ctx)
+         if (
+             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+             == torch.bfloat16
+@@ -364,6 +401,8 @@
+ 
+         suffix_out = suffix_out[:, -self.config.action_horizon :]
+         suffix_out = suffix_out.to(dtype=torch.float32)
++        if meci_ctx is not None:
++            suffix_out = self.meci_correction.pre_head(meci_ctx, suffix_out)
+ 
+         # Apply gradient checkpointing to final action projection if enabled
+         def action_out_proj_func(suffix_out):
+@@ -371,7 +410,11 @@
+ 
+         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+ 
+-        return F.mse_loss(u_t, v_t, reduction="none")
++        losses = F.mse_loss(u_t, v_t, reduction="none")
++        if meci_ctx is not None and self.meci_config.aux_weight > 0:
++            aux = self.meci_correction.aux_loss(meci_ctx, observation)
++            losses = losses + self.meci_config.aux_weight * aux[:, None, None].to(losses.dtype)
++        return losses
+ 
+     @torch.no_grad()
+     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+@@ -382,6 +425,7 @@
+             noise = self.sample_noise(actions_shape, device)
+ 
+         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
++        meci_ctx = self._meci_context(observation)
+ 
+         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+@@ -412,11 +456,16 @@
+                 past_key_values,
+                 x_t,
+                 expanded_time,
++                meci_ctx,
+             )
+ 
+             # Euler step - use new tensor assignment instead of in-place operation
+             x_t = x_t + dt * v_t
+             time += dt
++        meci_residual = self._meci_residual(observation, meci_ctx)
++        if meci_residual is not None:
++            # MECI explicit residual (normalized units): cumulative EE motion of the named effector == delta-p.
++            x_t = x_t + meci_residual.to(x_t.dtype)
+         return x_t
+ 
+     def denoise_step(
+@@ -426,9 +475,10 @@
+         past_key_values,
+         x_t,
+         timestep,
++        meci_ctx=None,
+     ):
+         """Apply one denoising step of the noise `x_t` at a given timestep."""
+-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
++        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep, meci_ctx)
+ 
+         suffix_len = suffix_pad_masks.shape[1]
+         batch_size = prefix_pad_masks.shape[0]
+@@ -459,4 +509,6 @@
+         suffix_out = outputs_embeds[1]
+         suffix_out = suffix_out[:, -self.config.action_horizon :]
+         suffix_out = suffix_out.to(dtype=torch.float32)
++        if meci_ctx is not None:
++            suffix_out = self.meci_correction.pre_head(meci_ctx, suffix_out)
+         return self.action_out_proj(suffix_out)
+diff -ruN a/src/openpi/policies/aloha_policy.py b/src/openpi/policies/aloha_policy.py
+--- a/src/openpi/policies/aloha_policy.py
++++ b/src/openpi/policies/aloha_policy.py
+@@ -5,6 +5,7 @@
+ import numpy as np
+ 
+ from openpi import transforms
++from openpi.models import model as _model
+ 
+ 
+ def make_aloha_example() -> dict:
+@@ -84,6 +85,9 @@
+         if "prompt" in data:
+             inputs["prompt"] = data["prompt"]
+ 
++        # MECI: pass optional spoken-correction inputs through unchanged.
++        inputs.update({k: data[k] for k in _model.CORRECTION_KEYS if k in data})
++
+         return inputs
+ 
+ 
+diff -ruN a/src/openpi/policies/droid_policy.py b/src/openpi/policies/droid_policy.py
+--- a/src/openpi/policies/droid_policy.py
++++ b/src/openpi/policies/droid_policy.py
+@@ -71,6 +71,9 @@
+                 data["prompt"] = data["prompt"].decode("utf-8")
+             inputs["prompt"] = data["prompt"]
+ 
++        # MECI: pass optional spoken-correction inputs through unchanged.
++        inputs.update({k: data[k] for k in _model.CORRECTION_KEYS if k in data})
++
+         return inputs
+ 
+ 
+diff -ruN a/src/openpi/policies/libero_policy.py b/src/openpi/policies/libero_policy.py
+--- a/src/openpi/policies/libero_policy.py
++++ b/src/openpi/policies/libero_policy.py
+@@ -80,6 +80,9 @@
+         if "prompt" in data:
+             inputs["prompt"] = data["prompt"]
+ 
++        # MECI: pass optional spoken-correction inputs through unchanged.
++        inputs.update({k: data[k] for k in _model.CORRECTION_KEYS if k in data})
++
+         return inputs
+ 
+ 
+diff -ruN a/src/openpi/shared/meci_metric.py b/src/openpi/shared/meci_metric.py
+--- a/src/openpi/shared/meci_metric.py
++++ b/src/openpi/shared/meci_metric.py
+@@ -0,0 +1,483 @@
++"""MECI for pi0.5 -- framework-agnostic (NumPy) metric-correction utilities.
++
++Spoken mid-execution corrections are *metric end-effector nudges* that may name the effector:
++    "left hand more left half an inch", "right gripper up 1 cm", "move forward 1 inch",
++    "rotate gripper 10 degrees".
++They are parsed into (effector e, direction, magnitude) -> a 6-D Cartesian displacement
++delta_p = [dx, dy, dz, droll, dpitch, dyaw] in metres / radians in a declared frame, and then
++mapped into openpi's *normalized* action space for the platform's action layout.
++
++Everything here is pure NumPy so the same code serves the JAX model (meci_correction.py), the
++PyTorch model (meci_correction_pytorch.py), the policy server and the data pipeline.
++
++Action layouts and normalisation verified in Physical-Intelligence/openpi @ 215abfb217dbac7d5f1273282331b9b1866c0479:
++  * ALOHA  (pi05_aloha, src/openpi/training/config.py l.572-579; LeRobotAlohaDataConfig l.228-279;
++            src/openpi/policies/aloha_policy.py):
++      14-D = [left 6 joints, left gripper, right 6 joints, right gripper]   (aloha_policy.py l.160-161)
++      joints are deltas relative to the state at the start of the chunk:
++      DeltaActions(make_bool_mask(6, -1, 6, -1))                            (config.py l.263-267)
++      pi-space joints = _joint_flip_mask() * aloha joints                   (aloha_policy.py l.104-106, l.190-202)
++  * LIBERO (pi05_libero, config.py l.743-763; LeRobotLiberoDataConfig extra_delta_transform=False):
++      7-D = [EE dpos(3), EE drot(3), gripper]  (libero_policy.py l.100 LiberoOutputs returns [..., :7]);
++      per-step OSC_POSE deltas in [-1, 1] (LIBERO env_wrapper.py l.17 controller="OSC_POSE"); robosuite
++      v1.4.0/v1.4.1 controllers/config/osc_pose.json l.5 output_max = [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
++      (m, rad) per unit action -- this is the commanded set-point delta; the executed motion depends on the
++      impedance gains and must be calibrated (open decision).
++  * DROID  (pi05_droid, config.py l.629-642): 8-D = [7 joints, gripper] (droid_policy.py DroidOutputs);
++      no DeltaActions in the inference config; pi05_full_droid_finetune / pi05_droid_finetune use
++      DroidActionSpace.JOINT_POSITION + DeltaActions(make_bool_mask(7, -1)) (config.py l.403-408).
++  * Normalisation: pi0.5 uses *quantile* normalisation (config.py l.187:
++      use_quantile_norm = model_config.model_type != ModelType.PI0), transforms.py l.141-145 / l.175-181:
++        x_n = (x - q01) / (q99 - q01 + 1e-6) * 2 - 1 ;  dims beyond len(q01) pass through on unnormalize.
++      pi0 (not pi0.5) uses z-score: x_n = (x - mean) / (std + 1e-6)  (transforms.py l.137-139).
++      Both are affine per dimension, so an *additive* residual maps exactly:
++        quantile: dn = 2 * dx / (q99 - q01 + 1e-6) ;  z-score: dn = dx / (std + 1e-6).
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable, Sequence
++import dataclasses
++import math
++import re
++
++import numpy as np
++
++# ----------------------------------------------------------------------------------------------
++# 1. Units, directions, effectors
++# ----------------------------------------------------------------------------------------------
++INCH_TO_M = 0.0254
++CM_TO_M = 0.01
++MM_TO_M = 0.001
++DEG_TO_RAD = math.pi / 180.0
++
++# Declared spoken-language frame (robot base). Axis signs are PLACEHOLDERS to be calibrated per
++# platform by commanding a known residual and observing the EE motion (see DESIGN.md, open decisions).
++CORRECTION_FRAME = "robot_base"
++DIRECTION_AXES: dict[str, tuple[int, int]] = {
++    "forward": (0, +1),
++    "back": (0, -1),
++    "left": (1, +1),
++    "right": (1, -1),
++    "up": (2, +1),
++    "down": (2, -1),
++}
++ROTATION_AXES: dict[str, tuple[int, int]] = {"roll": (3, +1), "pitch": (4, +1), "yaw": (5, +1)}
++ROTATION_ALIASES = {"gripper": "yaw", "wrist": "yaw", "end effector": "yaw", "end-effector": "yaw"}
++
++EFFECTORS = ("default", "left", "right")
++EFFECTOR_TO_ID = {e: i for i, e in enumerate(EFFECTORS)}
++EFFECTOR_ALIASES: tuple[tuple[str, str], ...] = (
++    ("left hand", "left"),
++    ("left arm", "left"),
++    ("left gripper", "left"),
++    ("right hand", "right"),
++    ("right arm", "right"),
++    ("right gripper", "right"),
++)
++
++_WORD_MAGNITUDES = {
++    "a quarter": 0.25,
++    "quarter": 0.25,
++    "a half": 0.5,
++    "half": 0.5,
++    "one": 1.0,
++    "two": 2.0,
++    "three": 3.0,
++    "four": 4.0,
++    "five": 5.0,
++    "ten": 10.0,
++}
++_UNIT_ALIASES = {
++    "in": "inch",
++    "inch": "inch",
++    "inches": "inch",
++    "cm": "cm",
++    "centimeter": "cm",
++    "centimeters": "cm",
++    "centimetre": "cm",
++    "centimetres": "cm",
++    "mm": "mm",
++    "millimeter": "mm",
++    "millimeters": "mm",
++    "millimetre": "mm",
++    "millimetres": "mm",
++    "m": "m",
++    "meter": "m",
++    "meters": "m",
++    "metre": "m",
++    "metres": "m",
++    "deg": "deg",
++    "degs": "deg",
++    "degree": "deg",
++    "degrees": "deg",
++    "rad": "rad",
++    "radian": "rad",
++    "radians": "rad",
++}
++_UNIT_RE = (
++    r"(?P<unit>inch(?:es)?|in\b|centimet(?:er|re)s?|cm\b|millimet(?:er|re)s?|mm\b|met(?:er|re)s?|m\b|"
++    r"degrees?|degs?\b|radians?|rad\b)"
++)
++
++
++@dataclasses.dataclass
++class MetricCommand:
++    """A parsed metric nudge."""
++
++    kind: str  # "translate" | "rotate"
++    direction: str  # forward/back/left/right/up/down or roll/pitch/yaw
++    magnitude: float  # in `unit`
++    unit: str  # canonical unit
++    axis: int  # index into the 6-D Cartesian delta
++    sign: int
++    effector: str = "default"  # "default" | "left" | "right"
++    phrase: str = ""
++
++    @property
++    def effector_id(self) -> int:
++        return EFFECTOR_TO_ID[self.effector]
++
++    def delta_p(self) -> np.ndarray:
++        """6-D Cartesian displacement [dx, dy, dz, droll, dpitch, dyaw] in metres / radians."""
++        d = np.zeros(6, dtype=np.float32)
++        d[self.axis] = self.sign * magnitude_to_si(self.magnitude, self.unit, self.kind)
++        return d
++
++
++def magnitude_to_si(magnitude: float, unit: str, kind: str) -> float:
++    u = _UNIT_ALIASES.get(unit.lower().strip(), unit.lower().strip())
++    if kind == "rotate":
++        if u == "deg":
++            return magnitude * DEG_TO_RAD
++        if u == "rad":
++            return magnitude
++        raise ValueError(f"unsupported rotation unit {unit!r}")
++    table = {"inch": INCH_TO_M, "cm": CM_TO_M, "mm": MM_TO_M, "m": 1.0}
++    if u not in table:
++        raise ValueError(f"unsupported translation unit {unit!r}")
++    return magnitude * table[u]
++
++
++def parse_metric_command(phrase: str) -> MetricCommand | None:
++    """Rule-based parser (the ASR -> parser baseline) for templated metric nudges.
++
++    The effector phrase ("left hand", "right gripper", ...) is matched and removed *first*, so in
++    "left hand more left half an inch" the first "left" is the effector and the second the direction.
++    Returns None if the phrase is not a metric nudge.
++    """
++    text = " ".join(phrase.lower().replace(",", " ").strip().split())
++    if not text:
++        return None
++    effector = "default"
++    for alias, canon in EFFECTOR_ALIASES:
++        if re.search(rf"\b{re.escape(alias)}\b", text):
++            effector = canon
++            text = " ".join(re.sub(rf"\b{re.escape(alias)}\b", " ", text, count=1).split())
++            break
++
++    # magnitude + unit
++    mag = unit = None
++    for word, val in sorted(_WORD_MAGNITUDES.items(), key=lambda kv: -len(kv[0])):
++        m = re.search(rf"\b{re.escape(word)}\b\s+(?:an?\s+)?{_UNIT_RE}", text)
++        if m:
++            mag, unit = val, m.group("unit")
++            break
++    if mag is None:
++        m = re.search(rf"(?P<mag>\d+(?:\.\d+)?)\s*{_UNIT_RE}", text)
++        if m:
++            mag, unit = float(m.group("mag")), m.group("unit")
++    if mag is None:
++        return None
++    unit = _UNIT_ALIASES.get(unit.strip(), unit.strip())
++
++    if unit in ("deg", "rad") or re.search(r"\brotate\b|\bturn\b|\btwist\b", text):
++        kind = "rotate"
++        direction = None
++        for alias, canon in ROTATION_ALIASES.items():
++            if re.search(rf"\b{re.escape(alias)}\b", text):
++                direction = canon
++                break
++        for name in ROTATION_AXES:
++            if re.search(rf"\b{name}\b", text):
++                direction = name
++                break
++        direction = direction or "yaw"
++        axis, sign = ROTATION_AXES[direction]
++        if re.search(r"\b(counter[- ]?clockwise|anticlockwise)\b", text):
++            sign = +1
++        elif re.search(r"\bclockwise\b", text):
++            sign = -1
++    else:
++        kind = "translate"
++        direction = None
++        for name in ("forward", "backward", "back", "left", "right", "up", "down"):
++            if re.search(rf"\b{name}\b", text):
++                direction = "back" if name == "backward" else name
++                break
++        if direction is None:
++            return None
++        axis, sign = DIRECTION_AXES[direction]
++    return MetricCommand(kind, direction, float(mag), unit, axis, sign, effector=effector, phrase=phrase)
++
++
++# ----------------------------------------------------------------------------------------------
++# 2. Platform action layouts (verified in openpi @ 215abfb, see module docstring)
++# ----------------------------------------------------------------------------------------------
++@dataclasses.dataclass(frozen=True)
++class ArmSlice:
++    start: int  # first action index of this arm
++    num_joints: int  # 6 (ALOHA), 7 (DROID); for Cartesian layouts: 6 = [dpos, drot]
++    gripper_index: int
++
++
++@dataclasses.dataclass(frozen=True)
++class PlatformLayout:
++    name: str
++    action_dim: int  # dims used by the robot (model pads to 32)
++    arms: dict[str, ArmSlice]  # effector name -> slice ("default" always present)
++    space: str  # "cartesian" (EE deltas) or "joint"
++    # "per_step": each action is an increment (LIBERO OSC deltas, joint velocities): the residual is
++    #             spread so that SUM_t r_t = delta.
++    # "chunk_relative": actions are targets relative to the chunk-start state (openpi DeltaActions):
++    #             the residual is a ramp so that r_t = cumulative share * delta (final step = delta).
++    semantics: str
++    # Physical units per unit of *raw* (un-normalized) action, per Cartesian dim (cartesian space only).
++    # LIBERO: robosuite OSC_POSE output_max (m, rad) per unit input.
++    cartesian_scale: tuple[float, ...] | None = None
++    # Per-joint sign flip between the robot convention (where the Jacobian is defined) and openpi's
++    # model space (ALOHA adapt_to_pi). Length action_dim; None = identity.
++    joint_flip: tuple[float, ...] | None = None
++    # Control period in seconds (only for velocity semantics: residual / dt).
++    velocity_dt: float | None = None
++
++
++ALOHA = PlatformLayout(
++    name="aloha",
++    action_dim=14,
++    arms={
++        "left": ArmSlice(0, 6, 6),
++        "right": ArmSlice(7, 6, 13),
++        # Unnamed correction on a bimanual robot: do not guess an arm (residual is zero, flagged).
++    },
++    space="joint",
++    semantics="chunk_relative",
++    joint_flip=(1, -1, -1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1),  # aloha_policy._joint_flip_mask()
++)
++LIBERO = PlatformLayout(
++    name="libero",
++    action_dim=7,
++    arms={"default": ArmSlice(0, 6, 6)},
++    space="cartesian",
++    semantics="per_step",
++    cartesian_scale=(0.05, 0.05, 0.05, 0.5, 0.5, 0.5),
++)
++DROID_JOINT_POSITION = PlatformLayout(
++    name="droid_joint_position",
++    action_dim=8,
++    arms={"default": ArmSlice(0, 7, 7)},
++    space="joint",
++    semantics="chunk_relative",
++)
++DROID_JOINT_VELOCITY = PlatformLayout(
++    name="droid_joint_velocity",
++    action_dim=8,
++    arms={"default": ArmSlice(0, 7, 7)},
++    space="joint",
++    semantics="per_step",
++    # openpi examples/droid/main.py: DROID_CONTROL_FREQUENCY = 15 (l.23), RobotEnv(action_space="joint_velocity")
++    # (l.80). Whether DROID's joint_velocity actions are in rad/s or a scaled unit is NOT verified here, so the
++    # caller must set velocity_dt (and any scale) explicitly, e.g. dataclasses.replace(..., velocity_dt=1 / 15).
++    velocity_dt=None,
++)
++PLATFORMS = {p.name: p for p in (ALOHA, LIBERO, DROID_JOINT_POSITION, DROID_JOINT_VELOCITY)}
++
++
++def resolve_arm(layout: PlatformLayout, effector: str) -> ArmSlice | None:
++    """Named-effector routing. Single-arm platforms ignore the name; bimanual + unnamed -> None."""
++    if effector in layout.arms:
++        return layout.arms[effector]
++    if "default" in layout.arms and len(layout.arms) == 1:
++        return layout.arms["default"]
++    return None
++
++
++# ----------------------------------------------------------------------------------------------
++# 3. Cartesian -> joint (first order), for joint-space platforms (ALOHA, DROID)
++# ----------------------------------------------------------------------------------------------
++def dls_joint_delta(jacobian: np.ndarray, delta_p: np.ndarray, damping: float = 1e-3) -> np.ndarray:
++    """Damped-least-squares inverse kinematics step: dq = J^T (J J^T + lambda^2 I)^-1 dp.
++
++    `jacobian` is the (6, n) geometric Jacobian of the named arm at the current joint state, in the
++    same frame as `delta_p`. openpi does not ship arm kinematics; the caller supplies J (e.g. from the
++    ViperX-300s URDF for ALOHA, Franka for DROID). First-order: exact for small nudges only.
++    """
++    jac = np.asarray(jacobian, dtype=np.float64)
++    dp = np.asarray(delta_p, dtype=np.float64).reshape(-1)
++    jjt = jac @ jac.T
++    return (jac.T @ np.linalg.solve(jjt + (damping**2) * np.eye(jjt.shape[0]), dp)).astype(np.float32)
++
++
++# ----------------------------------------------------------------------------------------------
++# 4. Physical residual over the hold window, routed to the named effector
++# ----------------------------------------------------------------------------------------------
++def hold_fade_strengths(hold_steps: int = 16, fade_steps: int = 8) -> np.ndarray:
++    """Per-control-step strengths of a correction: 1 during the hold, linear fade to 0."""
++    s = np.ones(hold_steps, dtype=np.float32)
++    if fade_steps > 0:
++        f = min(fade_steps, hold_steps)
++        s[-f:] = np.arange(f, 0, -1, dtype=np.float32) / float(f)
++    return s
++
++
++def raw_action_delta(
++    layout: PlatformLayout,
++    delta_p: np.ndarray,
++    effector: str,
++    jacobian_fn: Callable[[str], np.ndarray] | None = None,
++) -> tuple[np.ndarray, bool]:
++    """Total raw-action-space displacement (length layout.action_dim) for the named effector.
++
++    Returns (delta_a, routed). routed=False when the effector cannot be resolved (bimanual + unnamed),
++    in which case delta_a is all zeros: the residual is withheld and the learned path decides.
++    Gripper dims are never touched by metric nudges.
++    """
++    out = np.zeros(layout.action_dim, dtype=np.float32)
++    arm = resolve_arm(layout, effector)
++    if arm is None:
++        return out, False
++    dp = np.asarray(delta_p, dtype=np.float32).reshape(6)
++    if layout.space == "cartesian":
++        scale = np.asarray(layout.cartesian_scale, dtype=np.float32)
++        out[arm.start : arm.start + 6] = dp / scale
++    else:
++        if jacobian_fn is None:
++            raise ValueError(f"{layout.name}: joint-space platform needs a jacobian_fn(effector) -> (6, n_joints)")
++        key = effector if effector in layout.arms else "default"
++        dq = dls_joint_delta(jacobian_fn(key), dp)
++        if dq.shape[0] != arm.num_joints:
++            raise ValueError(f"Jacobian has {dq.shape[0]} joints, layout expects {arm.num_joints}")
++        out[arm.start : arm.start + arm.num_joints] = dq  # velocity layouts: divided by dt in chunk_residual
++        if layout.joint_flip is not None:
++            out = out * np.asarray(layout.joint_flip, dtype=np.float32)
++    return out, True
++
++
++def chunk_residual(
++    layout: PlatformLayout,
++    delta_a: np.ndarray,
++    window_strengths: np.ndarray,
++    chunk_start: int,
++    action_horizon: int,
++) -> np.ndarray:
++    """Raw-space residual for one action chunk of length `action_horizon` that starts `chunk_start`
++    control steps after the utterance. Over the whole hold window:
++      per_step:        SUM over the window of r_t            == delta_a
++      chunk_relative:  r at the last window step of a chunk  == remaining share of delta_a
++                       (each new chunk is re-based on the state, which already contains the motion done)
++    Returns (action_horizon, action_dim).
++    """
++    w = np.asarray(window_strengths, dtype=np.float64)
++    total = max(w.sum(), 1e-12)
++    n_win = len(w)
++    steps = np.arange(chunk_start, chunk_start + action_horizon)
++    share = np.where(steps < n_win, w[np.clip(steps, 0, n_win - 1)], 0.0) / total  # per-step share
++    if layout.semantics == "per_step":
++        coeff = share
++        if layout.velocity_dt is not None:
++            coeff = coeff / layout.velocity_dt
++    elif layout.semantics == "chunk_relative":
++        coeff = np.cumsum(share)  # ramp, relative to the chunk-start state
++    else:
++        raise ValueError(layout.semantics)
++    return (coeff[:, None] * np.asarray(delta_a, dtype=np.float64)[None, :]).astype(np.float32)
++
++
++# ----------------------------------------------------------------------------------------------
++# 5. Map into openpi's normalized action space (pi0.5: quantile; pi0: z-score)
++# ----------------------------------------------------------------------------------------------
++def normalize_residual(
++    residual: np.ndarray,
++    *,
++    model_action_dim: int = 32,
++    q01: np.ndarray | None = None,
++    q99: np.ndarray | None = None,
++    mean: np.ndarray | None = None,
++    std: np.ndarray | None = None,
++    use_quantiles: bool = True,
++) -> np.ndarray:
++    """Additive raw residual -> additive residual in openpi's normalized, zero-padded model space.
++
++    Exact because openpi's Normalize/Unnormalize are per-dimension affine maps
++    (transforms.py l.137-145, l.170-181). Dims beyond the stats length pass through unchanged on
++    Unnormalize, so they map 1:1 (they are zero for metric nudges anyway).
++    """
++    r = np.asarray(residual, dtype=np.float64)
++    out = np.zeros((*r.shape[:-1], model_action_dim), dtype=np.float64)
++    out[..., : r.shape[-1]] = r
++    if use_quantiles:
++        q01 = np.asarray(q01, dtype=np.float64)
++        q99 = np.asarray(q99, dtype=np.float64)
++        d = min(q01.shape[-1], model_action_dim)
++        out[..., :d] = out[..., :d] * 2.0 / (q99[:d] - q01[:d] + 1e-6)
++    else:
++        std = np.asarray(std, dtype=np.float64)
++        d = min(std.shape[-1], model_action_dim)
++        out[..., :d] = out[..., :d] / (std[:d] + 1e-6)
++    return out.astype(np.float32)
++
++
++def unnormalize_quantile(x_n: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
++    """Copy of openpi transforms.Unnormalize._unnormalize_quantile (transforms.py l.175-181) for tests."""
++    q01 = np.asarray(q01)
++    q99 = np.asarray(q99)
++    dim = q01.shape[-1]
++    if dim < x_n.shape[-1]:
++        return np.concatenate([(x_n[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x_n[..., dim:]], axis=-1)
++    return (x_n + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
++
++
++def build_correction_inputs(
++    phrase_or_cmd: str | MetricCommand,
++    layout: PlatformLayout,
++    *,
++    action_horizon: int,
++    chunk_start: int = 0,
++    window_strengths: np.ndarray | None = None,
++    norm_stats_actions=None,
++    model_action_dim: int = 32,
++    jacobian_fn: Callable[[str], np.ndarray] | None = None,
++) -> dict | None:
++    """Policy-side helper: phrase -> the `correction_*` keys consumed by the patched openpi model.
++
++    `norm_stats_actions` is openpi's NormStats for the "actions" key (has .q01/.q99 for pi0.5).
++    Audio features (`correction_audio`, `correction_audio_mask`) are added separately by the frozen
++    Whisper encoder.
++    """
++    cmd = parse_metric_command(phrase_or_cmd) if isinstance(phrase_or_cmd, str) else phrase_or_cmd
++    if cmd is None:
++        return None
++    w = hold_fade_strengths() if window_strengths is None else np.asarray(window_strengths, np.float32)
++    dp = cmd.delta_p()
++    delta_a, routed = raw_action_delta(layout, dp, cmd.effector, jacobian_fn)
++    r = chunk_residual(layout, delta_a, w, chunk_start, action_horizon)
++    rn = normalize_residual(
++        r, model_action_dim=model_action_dim, q01=norm_stats_actions.q01, q99=norm_stats_actions.q99
++    )
++    step = min(chunk_start, len(w) - 1)
++    strength = float(w[step]) if chunk_start < len(w) else 0.0
++    return {
++        "correction_active": np.bool_(strength > 0.0),
++        "correction_strength": np.float32(strength),
++        "correction_delta": dp.astype(np.float32),
++        "correction_effector": np.int32(cmd.effector_id),
++        "correction_residual": rn if routed else np.zeros_like(rn),
++    }
++
++
++def make_correction_jacobian_fn(jacobians: dict[str, np.ndarray]) -> Callable[[str], np.ndarray]:
++    """Convenience: fixed per-arm Jacobians (e.g., computed once at the utterance from the state)."""
++    return lambda effector: jacobians[effector]
++
++
++__all__: Sequence[str] = [n for n in dir() if not n.startswith("_")]
+diff -ruN a/src/openpi/training/weight_loaders.py b/src/openpi/training/weight_loaders.py
+--- a/src/openpi/training/weight_loaders.py
++++ b/src/openpi/training/weight_loaders.py
+@@ -50,8 +50,8 @@
+     def load(self, params: at.Params) -> at.Params:
+         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
+         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+-        # Add all missing LoRA weights.
+-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
++        # Add all missing LoRA weights and the (new) MECI correction-adapter weights.
++        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*meci_correction.*")
+ 
+ 
+ @dataclasses.dataclass(frozen=True)

@@ -1,0 +1,45 @@
+saved {'jax_loss': (2, 10), 'jax_sample': (2, 10, 32), 'torch_loss': (2, 10, 32), 'torch_sample': (2, 10, 32)}
+.............................                                            [100%]
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED test_meci_pi05.py::test_parser[left hand more left half an inch-left-left-0.0127]
+PASSED test_meci_pi05.py::test_parser[right gripper up 1 cm-right-up-0.01]
+PASSED test_meci_pi05.py::test_parser[move forward 1 inch-default-forward-0.0254]
+PASSED test_meci_pi05.py::test_parser[Left arm, back two centimeters-left-back-0.02]
+PASSED test_meci_pi05.py::test_parser[right hand down 5 mm-right-down-0.005]
+PASSED test_meci_pi05.py::test_parser[rotate gripper 10 degrees-default-yaw-0.17453292519943295]
+PASSED test_meci_pi05.py::test_parser[left gripper move right a quarter inch-left-right-0.00635]
+PASSED test_meci_pi05.py::test_parser_rejects_non_metric[pick up the other cup]
+PASSED test_meci_pi05.py::test_parser_rejects_non_metric[left hand]
+PASSED test_meci_pi05.py::test_parser_rejects_non_metric[]
+PASSED test_meci_pi05.py::test_parser_rejects_non_metric[go left]
+PASSED test_meci_pi05.py::test_libero_per_step_residual_sums_to_delta_p_through_openpi_unnormalize
+PASSED test_meci_pi05.py::test_aloha_chunk_relative_ramp_and_routing
+PASSED test_meci_pi05.py::test_aloha_unnamed_effector_is_not_guessed
+PASSED test_meci_pi05.py::test_single_arm_ignores_effector_name
+PASSED test_meci_pi05.py::test_build_correction_inputs_keys
+PASSED test_meci_pi05.py::test_patched_model_without_correction_matches_pristine_openpi
+PASSED test_meci_pi05.py::test_zero_init_gates_identity_with_active_correction
+PASSED test_meci_pi05.py::test_inactive_correction_identity_even_with_trained_gates
+PASSED test_meci_pi05.py::test_open_gates_change_only_active_samples
+PASSED test_meci_pi05.py::test_each_fusion_path_is_live[gate_in]
+PASSED test_meci_pi05.py::test_each_fusion_path_is_live[gate_ada]
+PASSED test_meci_pi05.py::test_each_fusion_path_is_live[gate_head]
+PASSED test_meci_pi05.py::test_explicit_residual_added_to_sampled_chunk
+PASSED test_meci_pi05.py::test_suffix_token_mode_identity_when_inactive_and_live_when_active
+PASSED test_meci_pi05.py::test_training_loss_aux_and_gradients_reach_gates
+PASSED test_meci_pi05.py::test_meci_params_are_merged_by_checkpoint_loader
+PASSED test_meci_pi05.py::test_rl_helpers
+PASSED test_meci_pi05.py::test_observation_from_dict_and_policy_inputs_carry_correction
+29 passed, 3 deselected in 136.09s (0:02:16)
+...                                                                      [100%]
+==================================== PASSES ====================================
+__________________ test_torch_training_backward_reaches_gates __________________
+----------------------------- Captured stdout call -----------------------------
+Forcing gradient checkpointing to be enabled for Gemma expert model
+=========================== short test summary info ============================
+PASSED test_meci_pi05.py::test_torch_identity_and_residual
+PASSED test_meci_pi05.py::test_torch_gates_and_suffix_mode
+PASSED test_meci_pi05.py::test_torch_training_backward_reaches_gates
+3 passed, 29 deselected in 55.36s
+rc=0

@@ -1,0 +1,34 @@
+checking file src/openpi/models/meci_correction.py
+checking file src/openpi/models/model.py
+checking file src/openpi/models/pi0.py
+checking file src/openpi/models/pi0_config.py
+checking file src/openpi/models_pytorch/meci_correction_pytorch.py
+checking file src/openpi/models_pytorch/pi0_pytorch.py
+checking file src/openpi/policies/aloha_policy.py
+checking file src/openpi/policies/droid_policy.py
+checking file src/openpi/policies/libero_policy.py
+checking file src/openpi/shared/meci_metric.py
+checking file src/openpi/training/weight_loaders.py
+patching file src/openpi/models/meci_correction.py
+patching file src/openpi/models/model.py
+patching file src/openpi/models/pi0.py
+patching file src/openpi/models/pi0_config.py
+patching file src/openpi/models_pytorch/meci_correction_pytorch.py
+patching file src/openpi/models_pytorch/pi0_pytorch.py
+patching file src/openpi/policies/aloha_policy.py
+patching file src/openpi/policies/droid_policy.py
+patching file src/openpi/policies/libero_policy.py
+patching file src/openpi/shared/meci_metric.py
+patching file src/openpi/training/weight_loaders.py
+py_compile OK: 11 files
+identical to tested tree: src/openpi/models/model.py
+identical to tested tree: src/openpi/models/pi0.py
+identical to tested tree: src/openpi/models/meci_correction.py
+identical to tested tree: src/openpi/models/pi0_config.py
+identical to tested tree: src/openpi/shared/meci_metric.py
+identical to tested tree: src/openpi/policies/libero_policy.py
+identical to tested tree: src/openpi/policies/aloha_policy.py
+identical to tested tree: src/openpi/policies/droid_policy.py
+identical to tested tree: src/openpi/training/weight_loaders.py
+identical to tested tree: src/openpi/models_pytorch/pi0_pytorch.py
+identical to tested tree: src/openpi/models_pytorch/meci_correction_pytorch.py
